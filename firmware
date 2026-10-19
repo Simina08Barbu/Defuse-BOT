@@ -1,1 +1,208 @@
+#include <BLEDevice.h> #include <BLEServer.h> #include <BLEUtils.h> #include <BLE2902.h> #include <ESP32Servo.h> #include <SPI.h> #include <nRF24L01.h> #include <RF24.h>
+
+// configurare pini hardware
+// pini motoare tractiune (tb6612) const int PWMA = 1;
+const int AIN1 = 4; const int AIN2 = 2;
+const int PWMB = 8; const int BIN1 = 6; const int BIN2 = 7; const int STBY = 5;
+// pini servomotoare int pinServoX = 10; int pinServoY = 11;
+
+// pini module de forta (mosfet) const int pinPompa = 9;
+const int pinMosfet17 = 17;
+
+// pini magistrala spi pentru nrf24 #define CE_PIN	18
+#define CSN_PIN 47
+#define SCK_PIN 12
+#define MOSI_PIN 13
+#define MISO_PIN 14
+Servo servoX; Servo servoY;
+RF24 radio(CE_PIN, CSN_PIN);
+SPIClass *customSPI = NULL;
+void mergeInainte(); void mergeInapoi(); void viraStanga(); void viraDreapta(); void stopMasina();
+
+// setari server ble BLEServer *pServer = NULL;
+BLECharacteristic * pTxCharacteristic; bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+#define SERVICE_UUID	“6E400001-B5A3-F393-E0A9-E50E24DCCA9E” #define CHARACTERISTIC_UUID_RX “6E400002-B5A3-F393-E0A9-E50E24DCCA9E” #define CHARACTERISTIC_UUID_TX “6E400003-B5A3-F393-E0A9-E50E24DCCA9E”
+ 
+
+
+// callback pentru monitorizarea conexiunii si siguranta (fail-safe) class MyServerCallbacks : public BLEServerCallbacks
+{
+void onConnect(BLEServer* pServer)
+{
+deviceConnected = true;
+Serial.println(“Dispozitiv BLE Conectat!”);
+}
+
+void onDisconnect(BLEServer* pServer)
+{
+deviceConnected = false;
+Serial.println(“Dispozitiv BLE Deconectat!”);
+
+// oprire de siguranta la pierderea conexiunii stopMasina();
+digitalWrite(pinPompa, LOW); digitalWrite(pinMosfet17, LOW);
+}
+};
+// callback pentru parsarea comenzilor primite
+class MyCallbacks : public BLECharacteristicCallbacks
+{
+void onWrite(BLECharacteristic *pCharacteristic)
+{
+String data = pCharacteristic->getValue();
+
+if (data.length() > 0)
+{
+data.trim(); Serial.print(“Comanda primita: “); Serial.println(data);
+
+// control semnal pwm viteza if (data.startsWith(“V”))
+{
+int viteza = data.substring(1).toInt(); analogWrite(PWMA, viteza); analogWrite(PWMB, viteza);
+}
+// control servomotoare cu filtru de 64edicate6464 mecanica else if (data.startsWith(“X”))
+{
+int unghiX = data.substring(1).toInt(); unghiX = constrain(unghiX, 20, 200); servoX.write(unghiX);
+}
+else if (data.startsWith(“Y”))
+{
+int unghiY = data.substring(1).toInt(); unghiY = constrain(unghiY, 0, 150); servoY.write(unghiY);
+}
+// control 64edicate64 motoare tractiune else if (data == “F”) { mergeInainte(); } else if (data == “B”) { mergeInapoi(); } else if (data == “L”) { viraStanga();	} else if (data == “R”) { viraDreapta(); } else if (data == “S”) { stopMasina();	}
+ 
+
+// control on/off actuator pompa else if (data == “P”)
+{
+digitalWrite(pinPompa, HIGH); Serial.println(“Pompa PORNITA”);
+}
+else if (data == “p”)
+{
+digitalWrite(pinPompa, LOW); Serial.println(“Pompa OPRITA”);
+}
+// control on/off modul jammer else if (data == “J”)
+{
+digitalWrite(pinMosfet17, HIGH); Serial.println(“Jammer PORNIT”);
+}
+else if (data == “j”)
+{
+digitalWrite(pinMosfet17, LOW); Serial.println(“Jammer OPRIT”);
+}
+}
+}
+};
+
+// task freertos pe core 0 pentru rularea buclei de bruiaj rf void taskRF24(void * parameter)
+{
+customSPI = new SPIClass(FSPI);
+customSPI->begin(SCK_PIN, MISO_PIN, MOSI_PIN, CSN_PIN);
+if (!radio.begin(customSPI))
+{
+Serial.println(“Eroare nRF24L01! Task-ul radio se opreste.”);
+vTaskDelete(NULL);
+}
+
+Serial.println(“nRF24L01 initializat pe Core 0.”); radio.setPALevel(RF24_PA_MAX); radio.setDataRate(RF24_2MBPS); radio.stopListening();
+byte payload[32]; memset(payload, 0xFF, 32);
+for(;
+{
+// baleiere rapida prin canale
+for (int canal = 29; canal <= 90; canal++)
+{
+radio.setChannel(canal);
+vTaskDelay(1); // yield obligatoriu pentru watchdog
+for (int i = 0; i < 3; i++)
+{
+radio.write(payload, 32);
+}
+}
+vTaskDelay(1);
+}
+}
+ 
+
+
+void setup()
+{
+Serial.begin(115200);
+
+// initializare pini iesire
+pinMode(PWMA, OUTPUT); pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT); pinMode(PWMB, OUTPUT); pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT); pinMode(STBY, OUTPUT);
+pinMode(pinPompa, OUTPUT); pinMode(pinMosfet17, OUTPUT);
+// setare stari initiale hardware sigure digitalWrite(STBY, HIGH); digitalWrite(pinPompa, LOW); digitalWrite(pinMosfet17, LOW);
+// configurare frecvente si atasare servomotoare ESP32PWM::allocateTimer(0); ESP32PWM::allocateTimer(1); servoX.setPeriodHertz(50); servoY.setPeriodHertz(50);
+
+servoX.attach(pinServoX, 500, 2400);
+servoY.attach(pinServoY, 500, 2400); servoX.write(130);
+servoY.write(20);
+
+analogWrite(PWMA, 150);
+analogWrite(PWMB, 150);
+
+// lansare task 66edicate pe core 0
+xTaskCreatePinnedToCore(taskRF24, “Task_RF”, 10000, NULL, 1, NULL, 0);
+
+// initializare stiva ble BLEDevice::init(“Masina_ESP32_S3”);
+pServer = BLEDevice::createServer();
+pServer->setCallbacks(new MyServerCallbacks());
+BLEService *pService = pServer->createService(SERVICE_UUID); pTxCharacteristic = pService->createCharacteristic(
+CHARACTERISTIC_UUID_TX,
+BLECharacteristic::PROPERTY_NOTIFY
+);
+pTxCharacteristic->addDescriptor(new BLE2902());
+
+BLECharacteristic * pRxCharacteristic = pService->createCharacteristic( CHARACTERISTIC_UUID_RX,
+BLECharacteristic::PROPERTY_WRITE
+);
+pRxCharacteristic->setCallbacks(new MyCallbacks());
+pService->start();
+pServer->getAdvertising()->start(); Serial.println(“Astept conexiuni BLE…”);
+}
+void loop()
+{
+// rutina de gestionare automata a reconectarilor ble if (!deviceConnected && oldDeviceConnected)
+ 
+
+{
+delay(500);
+pServer->startAdvertising(); Serial.println(“Astept conexiuni noi…”); oldDeviceConnected = deviceConnected;
+}
+if (deviceConnected && !oldDeviceConnected)
+{
+oldDeviceConnected = deviceConnected;
+}
+}	
+void mergeInainte()	
+{	
+digitalWrite(AIN1,	LOW);
+digitalWrite(AIN2,	HIGH);
+digitalWrite(BIN1,	LOW);
+digitalWrite(BIN2,	HIGH);
+}	
+void mergeInapoi()	
+{	
+digitalWrite(AIN1,	HIGH);
+digitalWrite(AIN2,	LOW);
+digitalWrite(BIN1,	HIGH);
+digitalWrite(BIN2,	LOW);
+}	
+void viraStanga()	
+{	
+digitalWrite(AIN1,	HIGH);
+digitalWrite(AIN2,	LOW);
+digitalWrite(BIN1,	LOW);
+digitalWrite(BIN2,	HIGH);
+}	
+void viraDreapta()	
+{	
+digitalWrite(AIN1,	LOW);
+digitalWrite(AIN2,	HIGH);
+digitalWrite(BIN1,	HIGH);
+digitalWrite(BIN2,	LOW);
+}	
+void stopMasina()	
+{	
+digitalWrite(AIN1,	LOW);
+digitalWrite(AIN2,	LOW);
+digitalWrite(BIN1,	LOW);
+digitalWrite(BIN2,	LOW);
+}	
 
