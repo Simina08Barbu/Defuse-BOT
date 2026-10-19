@@ -16,7 +16,7 @@ The system is built around a Dual-Core ESP32-S3 microcontroller, acting as the c
 * **Custom PCB**: A dedicated printed circuit board designed in KiCad that integrates the ESP32-S3, TB6612FNG motor drivers, and a 3S Li-Ion Battery Management System (BMS).
 * **Advanced Ground Control Station**: A Python-based GUI built with Tkinter, featuring concurrent multi-threading for asynchronous control, video rendering, and AI inference.
 
-![GUI Interface](images/gui_interface.png)
+![GUI Interface](images/gui_interface)
 *(Image Reference: Command Center GUI)*
 
 ## Hardware Architecture
