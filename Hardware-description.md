@@ -49,6 +49,6 @@ To ensure robustness, save space, and avoid loose wiring, a custom 2-layer PCB w
 <p align="center">
   <img src="images/pcb_kicad.png" width="45%" alt="PCB Design in KiCad">
   &nbsp; &nbsp;
-  <img src="images/pcb_assembled.jpg" width="45%" alt="Fully Assembled PCB">
+  <img src="images/pcb_assembled.png" width="45%" alt="Fully Assembled PCB">
 </p>
 *(Left: KiCad PCB Routing | Right: Fully Assembled and Soldered Custom Board)*
