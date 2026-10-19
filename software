@@ -1,1 +1,644 @@
+# importam bibliotecile necesare import cv2
+import tkinter as tk
+from PIL import Image, ImageTk import requests
+import threading import time import asyncio
+from bleak import BleakScanner, BleakClient import queue
+import os
+from ultralytics import YOLO
+ 
+
+# configurare generala
+# adresele de retea pentru modulul esp32 LED_URL	= "http://192.168.4.1:82/led" STREAM_URL = "http://192.168.4.1:81/stream"
+
+# setari pentru conexiunea bluetooth DEVICE_NAME = "Masina_ESP32_S3"
+RX_UUID	= "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+# timpi de asteptare si intervale pentru buclele de control CONTROL_LOOP_INTERVAL = 0.02 # intervalul la care citim tastele si trimitem comenzi
+VIDEO_UI_INTERVAL_MS	= 20	# intervalul de actualizare a interfetei video in milisecunde
+AI_DETECT_EVERY_N	= 5	# rulam modelul ai o data la 5 cadre pentru a economisi resurse
+BLE_WRITE_MIN_INTERVAL = 0.05 # timpul minim intre doua scrieri pe bluetooth
+
+# paleta de culori — verde militar / tactical
+# dictionar cu valorile hexazecimale ale culorilor folosite in interfata C = {
+"bg_dark": "#0D1A0D", "bg_panel": "#132213", "bg_card": "#1A2E1A", "green_main": "#2D5A27", "green_top": "#3D7A36", "green_light": "#4A8C42", "green_neon": "#7FD674", "amber":    "#D4A017",
+"red":     "#C0392B",
+"red_top":   "#E74C3C",
+"blue":    "#2980B9",
+"blue_top": "#3498DB", "text_main": "#D4E8D0", "text_dim": "#7A9E76", "text_bright": "#F0FAF0", "border": "#3A5E35", "border_glow": "#5EAD54", "shadow":   "#050D05",
+}
+
+# functii auxiliare - desenare dreptunghi rotunjit
+# functie auxiliara care deseneaza un dreptunghi cu colturi rotunjite pe canvas def rrect(cv, x1, y1, x2, y2, r, fill):
+# desenam cele 4 colturi rotunjite ca arcuri de cerc cv.create_arc(x1,	y1,	x1+2*r, y1+2*r, start=90, extent=90,
+fill=fill, outline=fill)
+cv.create_arc(x2-2*r, y1,	x2,	y1+2*r, start=0,	extent=90, fill=fill, outline=fill)
+cv.create_arc(x1,	y2-2*r, x1+2*r, y2,	start=180, extent=90, fill=fill, outline=fill)
+cv.create_arc(x2-2*r, y2-2*r, x2,	y2,	start=270, extent=90, fill=fill, outline=fill)
+# umplem spatiul dintre colturi cu doua dreptunghiuri suprapuse in forma de cruce
+cv.create_rectangle(x1+r, y1,	x2-r, y2,	fill=fill, outline=fill) cv.create_rectangle(x1,	y1+r, x2,	y2-r, fill=fill, outline=fill)
+# generare buton 3d interactiv
+# creaza un widget de tip canvas care simuleaza un buton 3d def btn3d(master, text, cmd, cm, ct, cs,
+w=160, h=48, fs=13, tc="#F0FAF0", icon=""):
+ 
+
+cv = tk.Canvas(master, width=w, height=h,
+bg=master.cget("bg"), highlightthickness=0, cursor="hand2")
+D = 5 # grosimea efectului de umbra/adancime 3d
+
+# functie interna care redeseneaza butonul in functie de starea lui (apasat sau nu)
+def draw(pressed=False):
+cv.delete("all") # stergem continutul anterior
+yo = 1 if pressed else 0 # offset pe axa y daca butonul e apasat if not pressed:
+rrect(cv, 3, D, w-3, h-1, 8, cs) # desenam umbra daca nu e apasat rrect(cv, 1, yo,	w-4, h-D+yo, 8, cm) # culoarea de baza
+rrect(cv, 3, yo+2, w-6, (h-D)//2+yo, 6, ct) # reflexia/partea superioara mai deschisa
+cv.create_rectangle(1, yo, w-4, h-D+yo, outline=ct, fill="") # contur full = f"{icon} {text}" if icon else text # combinam iconita cu textul # adaugam textul in centrul butonului
+cv.create_text((w-3)//2, (h-D)//2+yo+1, text=full,
+fill=tc, font=("Consolas", fs, "bold"), anchor="center") draw() # desenam starea initiala
+# atasam evenimente de mouse pentru animatia de apasare si executia comenzii cv.bind("<Enter>",	lambda e: draw(False))
+cv.bind("<ButtonPress-1>",	lambda e: draw(True)) cv.bind("<ButtonRelease-1>", lambda e: (draw(False), cmd())) cv.bind("<Leave>",	lambda e: draw(False))
+
+# stocam datele configurate intern pentru a putea fi modificate ulterior cv._data = {"text": text, "cm": cm, "ct": ct, "cs": cs,
+"w": w, "h": h, "fs": fs, "tc": tc, "icon": icon}
+return cv
+
+# functie pentru a actualiza textul sau culorile unui buton 3d deja creat def btn3d_update(cv, text=None, cm=None, ct=None):
+d = cv._data
+if text: d["text"] = text
+if cm:	d["cm"]	= cm
+if ct:	d["ct"]	= ct
+w, h, D = d["w"], d["h"], 5
+cv.delete("all")
+rrect(cv, 3, D, w-3, h-1, 8, d["cs"])
+rrect(cv, 1, 0, w-4, h-D, 8, d["cm"])
+rrect(cv, 3, 2, w-6, (h-D)//2, 6, d["ct"]) cv.create_rectangle(1, 0, w-4, h-D, outline=d["ct"], fill="") full = f"{d['icon']} {d['text']}" if d["icon"] else d["text"] cv.create_text((w-3)//2, (h-D)//2+1, text=full,
+fill=d["tc"], font=("Consolas", d["fs"], "bold"),
+anchor="center")
+
+# indicator de tip led pentru status
+# creaza un mic led vizual si o eticheta alaturata def indicator(parent, label):
+f = tk.Frame(parent, bg=C["bg_card"],
+highlightbackground=C["border"], highlightthickness=1) led = tk.Canvas(f, width=18, height=18, bg=C["bg_card"],
+highlightthickness=0)
+led.create_oval(3, 3, 15, 15, fill=C["green_main"], outline=C["border"], tags="dot")
+led.pack(side="left", padx=(8,4), pady=5)
+lbl = tk.Label(f, text=label, bg=C["bg_card"], fg=C["text_dim"], font=("Consolas", 11, "bold"), width=22, anchor="w")
+ 
+
+lbl.pack(side="left", padx=(0,8), pady=5) return f, led, lbl
+# clasa principala a aplicatiei class App(tk.Tk):
+def  init  (self): super(). init ()
+# setari de baza ale ferestrei principale self.title("TACTICAL RC — AI Vision Command Center") self.configure(bg=C["bg_dark"]) self.resizable(False, False)
+# initializare si incarcare model de inteligenta artificiala print("incarcam modelul ai...")
+d = os.path.dirname(os.path.abspath( file  )) cale = os.path.join(d, 'model_v2', 'best.pt') self.model = None
+# verificam daca fisierul modelului exista fizic pe disc if os.path.exists(cale):
+self.model = YOLO(cale)
+print("model ai incarcat cu succes.") else:
+print(f"eroare: modelul nu a fost gasit la calea: {cale}") # cream directorul pentru pozele facute daca acesta nu exista os.makedirs('rezultate_licenta', exist_ok=True)
+# declarare variabile de stare pentru masinuta
+# dictionar pentru starea curenta a tastelor folosite self.keys = {k: False for k in
+['w','a','s','d','up','down','left','right','q','e','p']}
+	self.last_mc	=	"S" #	starea anterioara a motorului (stop implicit)
+	self.ux	=	130;	self._lux = 130 # coordonate camera servo (axa
+x)				
+	self.uy	=	20;	self._luy = 20 # coordonate camera servo (axa
+y)				
+	self.pompa	=	False	# status pompa de apa
+	self.jammer	=	False	# status jammer (toggle) oglindeste starea esp32
+	self.flash	=	False	# status led flash wifi
+	self.viteza	=	150	# valoarea implicita a vitezei de deplasare (0-
+255)				
+	self.running	=	True	# variabila care mentine buclele active
+
+# variabile pentru fluxul video si calcularea cadrelor pe secunda (fps) self.cur_frame = None
+self.det_frame = None
+self.fcnt	= 0
+self.cmd_q	= queue.Queue(maxsize=10) # coada de comenzi pentru thread-ul bluetooth
+self._last_w	= 0.0 self._ble_ok	= False self._fps_t	= time.time() self._fps_n	= 0
+
+self._ui() # construim elementele vizuale din fereastra
+
+# mapam evenimentele de apasare si eliberare taste self.bind_all('<KeyPress>',	self._kp) self.bind_all('<KeyRelease>', self._kr)
+# click pe aplicatie preia focusul tastaturii inapoi pe fereastra self.bind_all('<Button-1>',	lambda e: self.after(1, self.focus_set)) self.focus_set()
+ 
+
+# initializam captura video de pe adresa masinutei self.cap = cv2.VideoCapture(STREAM_URL)
+# pornim thread-urile asincrone pentru a nu bloca interfata threading.Thread(target=self._cam_loop, daemon=True).start() # thread
+pentru receptie video
+threading.Thread(target=self._ctrl_loop, daemon=True).start() # thread pentru trimiterea de comenzi fizice
+threading.Thread(target=self._ble_start, daemon=True).start() # thread pentru conexiunea bluetooth
+# pornim buclele pentru interfata grafica self._vid_tick() # bucla de redare video in aplicatie
+self._ble_blink() # animatia de text cand bluetooth-ul cauta
+
+# functia care construieste interfata grafica (ui) def _ui(self):
+# bara de titlu superioara
+tb = tk.Frame(self, bg=C["bg_panel"],
+highlightbackground=C["green_light"],
+highlightthickness=2)
+tb.pack(fill="x")
+tk.Label(tb, text=" ⬡	TACTICAL RC — COMMAND CENTER ⬡",
+bg=C["bg_panel"], fg=C["green_neon"],
+font=("Consolas", 15, "bold")).pack(side="left", padx=16,
+ 
+pady=9)
+ 
+
+# eticheta de status pentru conexiunea bluetooth in bara de sus self.lbl_ble = tk.Label(tb, text="● BLE: CAUTARE...",
+bg=C["bg_panel"], fg=C["amber"],
+font=("Consolas", 12, "bold")) self.lbl_ble.pack(side="right", padx=16)
+ 
+# sectiunea principala impartita in partea stanga (video) si dreapta (butoane)
+body = tk.Frame(self, bg=C["bg_dark"]) body.pack(fill="both", padx=10, pady=8) left = tk.Frame(body, bg=C["bg_dark"]) right = tk.Frame(body, bg=C["bg_dark"]) left.pack(side="left", fill="both")
+right.pack(side="right", fill="y", padx=(10,0))
+
+# chenarul care incadreaza ecranul video principal vid_outer = tk.Frame(left, bg=C["green_main"],
+highlightbackground=C["border_glow"], highlightthickness=2)
+vid_outer.pack(pady=(0,6))
+
+ 
+
+
+
+
+
+
+pady=4)
+ 
+# panou de informatii deasupra feed-ului video vh = tk.Frame(vid_outer, bg=C["green_main"]) vh.pack(fill="x")
+tk.Label(vh, text="◉	LIVE AI VISION FEED", bg=C["green_main"], fg=C["text_bright"],
+font=("Consolas", 11, "bold")).pack(side="left", padx=8,
+ 
+
+# eticheta in care afisam numarul de cadre pe secunda procesate self.lbl_fps = tk.Label(vh, text="FPS: --",
+bg=C["green_main"], fg=C["green_neon"], font=("Consolas", 10))
+self.lbl_fps.pack(side="right", padx=8)
+# spatiul propriu zis unde va fi randata imaginea
+ 
+
+self.lbl_vid = tk.Label(vid_outer, bg="#000000", width=800, height=600) self.lbl_vid.pack()
+# consola de jos unde afisam mesaje text pentru utilizator self.lbl_status = tk.Label(left,
+text="▸ sistem pregatit. asteptare ble si wi-fi...", bg=C["bg_dark"], fg=C["text_dim"],
+font=("Consolas", 10), anchor="w") self.lbl_status.pack(fill="x", padx=2, pady=(2,6))
+# randul de butoane speciale sub feed-ul video (flash si captura imagine)
+br = tk.Frame(left, bg=C["bg_dark"]) br.pack(pady=4)
+self.btn_flash = btn3d(br, "FLASH OFF", self._toggle_flash,
+C["green_main"], C["green_top"], C["shadow"], w=214, h=52, fs=13, icon="ߒb)
+self.btn_flash.pack(side="left", padx=12) btn3d(br, "SNAPSHOT", self._snapshot,
+"#1A5C1A", "#267326", C["shadow"],
+w=214, h=52, fs=13, icon="ߓآ).pack(side="left", padx=12)
+
+# titlu pentru panoul de control din dreapta tk.Label(right, text="CONTROL PANEL",
+bg=C["bg_dark"], fg=C["green_light"], font=("Consolas", 13, "bold")).pack(pady=(0,5))
+
+ 
+
+masina
+ 
+# sectiunea cu led-uri virtuale ce indica starea componentelor de pe
+
+ind_lf = tk.LabelFrame(right, text=" STATUS PERIFERICE ",
+bg=C["bg_card"], fg=C["green_neon"], font=("Consolas", 10, "bold"), bd=2,
+ 
+relief="groove")
+ind_lf.pack(fill="x", pady=(0,7))
+f,l,lb = indicator(ind_lf, "MOTOR:	STOP");	f.pack(fill="x", padx=6, pady=2); self._im=(l,lb)
+f,l,lb = indicator(ind_lf, "POMPA:	OPRITA"); f.pack(fill="x", padx=6, pady=2); self._ip=(l,lb)
+f,l,lb = indicator(ind_lf, "JAMMER:	OPRIT"); f.pack(fill="x", padx=6, pady=2); self._ij=(l,lb)
+f,l,lb = indicator(ind_lf, "FLASH:	STINS"); f.pack(fill="x", padx=6, pady=2); self._if=(l,lb)
+# zona de ajustare si vizualizare a vitezei curente spd = tk.LabelFrame(right, text=" VITEZA MOTOR ",
+bg=C["bg_card"], fg=C["green_neon"], font=("Consolas", 10, "bold"), bd=2,
+relief="groove")
+spd.pack(fill="x", pady=(0,7))
+self.lbl_v = tk.Label(spd, text=f" {self.viteza} / 255",
+bg=C["bg_card"], fg=C["green_neon"], font=("Consolas", 24, "bold"))
+self.lbl_v.pack(pady=(6,2))
+
+# bara grafica de progres care vizualizeaza nivelul acceleratiei self._bar = tk.Canvas(spd, width=290, height=20,
+bg=C["bg_dark"], highlightthickness=0) self._bar.pack(padx=8, pady=(0,6)) self._draw_bar(self.viteza)
+# butoane pentru ajustarea manuala a vitezei sr = tk.Frame(spd, bg=C["bg_card"])
+ 
+
+sr.pack(pady=(0,8))
+btn3d(sr, "◀	−10", lambda: self._spd(self.viteza-10), C["green_main"], C["green_top"], C["shadow"], w=127, h=38, fs=11).pack(side="left", padx=5)
+btn3d(sr, "+10 ▶", lambda: self._spd(self.viteza+10), C["green_main"], C["green_top"], C["shadow"], w=127, h=38, fs=11).pack(side="left", padx=5)
+# d-pad directional folosit pentru apasarea manuala cu mouse-ul pe deplasarea masinii
+dp_lf = tk.LabelFrame(right, text=" DIRECTIE W / A / S / D ",
+bg=C["bg_card"], fg=C["green_neon"], font=("Consolas", 10, "bold"), bd=2,
+relief="groove")
+dp_lf.pack(fill="x", pady=(0,7))
+dp = tk.Frame(dp_lf, bg=C["bg_card"]) dp.pack(pady=6)
+bc = dict(cm=C["green_main"], ct=C["green_top"], cs=C["shadow"], w=76, h=48, fs=18)
+btn3d(dp, "▲", lambda: self._mmot("F"), **bc).grid(row=0, column=1, padx=3, pady=3)
+btn3d(dp, "◀", lambda: self._mmot("L"), **bc).grid(row=1, column=0, padx=3, pady=3)
+btn3d(dp, "■", lambda: self._mmot("S"), **bc).grid(row=1, column=1, padx=3, pady=3)
+btn3d(dp, "▶", lambda: self._mmot("R"), **bc).grid(row=1, column=2, padx=3, pady=3)
+btn3d(dp, "▼", lambda: self._mmot("B"), **bc).grid(row=2, column=1, padx=3, pady=3)
+# d-pad directional pentru a misca motoarele servo ale camerei cam_lf = tk.LabelFrame(right, text=" CAMERA SERVO ↑ ↓ ← → ",
+bg=C["bg_card"], fg=C["green_neon"], font=("Consolas", 10, "bold"), bd=2,
+relief="groove")
+cam_lf.pack(fill="x", pady=(0,7))
+cam = tk.Frame(cam_lf, bg=C["bg_card"]) cam.pack(pady=6)
+cc = dict(cm="#1A3A5C", ct="#255080", cs=C["shadow"], w=76, h=48, fs=18) btn3d(cam, "▲", lambda: self._sv("up"),	**cc).grid(row=0, column=1,
+padx=3, pady=3)
+btn3d(cam, "◀", lambda: self._sv("left"), **cc).grid(row=1, column=0, padx=3, pady=3)
+btn3d(cam, "●", lambda: self._sv_rst(),	**cc).grid(row=1, column=1, padx=3, pady=3)
+btn3d(cam, "▶", lambda: self._sv("right"), **cc).grid(row=1, column=2, padx=3, pady=3)
+btn3d(cam, "▼", lambda: self._sv("down"), **cc).grid(row=2, column=1, padx=3, pady=3)
+tk.Label(cam_lf, text="● = reset pozitie centrala", bg=C["bg_card"], fg=C["text_dim"],
+font=("Consolas", 9)).pack(pady=(0,5))
+# sectiunea accesoriilor (pompa de apa si sistemul de bruiaj) acc = tk.LabelFrame(right, text=" ACCESORII ",
+bg=C["bg_card"], fg=C["green_neon"], font=("Consolas", 10, "bold"), bd=2,
+relief="groove")
+acc.pack(fill="x", pady=(0,7))
+ar = tk.Frame(acc, bg=C["bg_card"]) ar.pack(pady=8)
+self.btn_pompa = btn3d(ar, "POMPA OFF", self._tog_pompa,
+ 
+
+C["blue"], C["blue_top"], C["shadow"], w=140, h=48, fs=11, icon="ߒǢ)
+self.btn_pompa.pack(side="left", padx=7)
+self.btn_jam = btn3d(ar, "JAMMER OFF", self._tog_jammer,
+C["red"], C["red_top"], C["shadow"], w=140, h=48, fs=11, icon="ߓb)
+self.btn_jam.pack(side="left", padx=7)
+
+# legenda cu tastele rapide folosite de la tastatura pentru control leg = tk.LabelFrame(right, text=" TASTE RAPIDE ",
+bg=C["bg_card"], fg=C["green_neon"], font=("Consolas", 10, "bold"), bd=2,
+relief="groove")
+leg.pack(fill="x")
+# iteram peste o lista de configurari pentru a scrie instructiunile for key, desc in [
+("W A S D",	"miscare masinuta"), ("Sageti",	"control camera servo"), ("Q / E",	"viteza − / +"),
+("P (tine)", "pornire pompa apa"),
+("J (toggle)","jammer rf on/off"),
+]:
+r = tk.Frame(leg, bg=C["bg_card"]) r.pack(fill="x", padx=8, pady=1)
+tk.Label(r, text=key, bg=C["bg_card"], fg=C["green_neon"], font=("Consolas", 10, "bold"), width=13,
+anchor="w").pack(side="left")
+tk.Label(r, text=f"→ {desc}", bg=C["bg_card"], fg=C["text_dim"], font=("Consolas", 10), anchor="w").pack(side="left")
+tk.Frame(leg, height=5, bg=C["bg_card"]).pack()
+
+# ────────────────────────────────────────────────────── # functii de ajutor (helpers) care modifica interfata
+# ──────────────────────────────────────────────────────
+# redeseneaza graficul in forma de bara de pe interfata pentru viteza in functie de valoare
+def _draw_bar(self, val):
+b = self._bar; b.delete("all")
+W, H = 290, 20
+f = int((val/255)*W) # calculam procentul de umplere # desenam fundalul barii goale
+b.create_rectangle(0, 0, W, H, fill=C["bg_dark"], outline=C["border"]) # cream un efect de gradient coloristic in functie de nivelul curent for i in range(f):
+ra = i/290
+r = int(30+ra*190); g = int(165-ra*110); bl = 30 b.create_line(i, 2, i, H-2, fill=f"#{r:02x}{g:02x}{bl:02x}")
+# aplicam conturul iluminat la final
+b.create_rectangle(0, 0, W-1, H-1, outline=C["border_glow"], fill="")
+
+# activeaza si schimba culoarea led-urilor de status vizual def _ind(self, tup, active, text, col=None):
+led, lbl = tup
+c = col or (C["green_neon"] if active else C["green_main"]) led.itemconfig("dot", fill=c, outline=c if active else C["border"]) lbl.configure(text=text, fg=c if active else C["text_dim"])
+
+# scrie mesaje noi in consola inferioara din panoul stang def _status(self, msg, col=None):
+self.lbl_status.configure(text=f"▸ {msg}", fg=col or C["text_dim"])
+ 
+
+# modifica valoarea de deplasare si constrange limitele intre 0 si 255 def _spd(self, val):
+self.viteza = max(0, min(255, int(val))) self.lbl_v.configure(text=f" {self.viteza} / 255") self._draw_bar(self.viteza)
+self.send(f"V{self.viteza}") # trimite noua comanda la esp32
+# inregistreaza apasarile pe panoul directional si trimite starea miscarii def _mmot(self, cmd):
+self.send(cmd); self.last_mc = cmd
+LB = {"F":"MOTOR: INAINTE","B":"MOTOR: INAPOI",
+"L":"MOTOR: STANGA", "R":"MOTOR: DREAPTA","S":"MOTOR: STOP"}
+LC = {"F":C["green_neon"],"B":C["amber"],
+"L":C["blue"],"R":"#9B59B6","S":C["text_dim"]}
+self._ind(self._im, cmd!="S", LB[cmd], LC[cmd]) # actualizeaza interfata
+grafica
+# modifica coordonatele unghiului pentru camera dupa axele x si y def _sv(self, d):
+if d=="left":	self.ux = min(200, self.ux+10); self.send(f"X{self.ux}")
+elif d=="right": self.ux = max(20, self.ux-10); self.send(f"X{self.ux}")
+elif d=="up":	self.uy = max(0,	self.uy-10); self.send(f"Y{self.uy}")
+elif d=="down": self.uy = min(150, self.uy+10); self.send(f"Y{self.uy}")
+# aduce ambele servo-motoare ale camerei in pozitia mediana implicit def _sv_rst(self):
+self.ux, self.uy = 130, 20 self.send("X130"); self.send("Y20")
+self._status("camera resetata la pozitia implicita.")
+
+# declanseaza prin apasare logica on/off a pompei cu apa de pe masinuta def _tog_pompa(self):
+if not self.pompa:
+self.pompa = True; self.send("P")
+self._ind(self._ip, True, "POMPA:	PORNITA", C["blue"]) btn3d_update(self.btn_pompa, "POMPA	ON", "#1A5C8C", "#2196C4") self._status("pompa de apa pornita.", C["blue"])
+else:
+self.pompa = False; self.send("p") self._ind(self._ip, False, "POMPA:	OPRITA")
+btn3d_update(self.btn_pompa, "POMPA OFF", C["blue"], C["blue_top"]) self._status("pompa de apa oprita.")
+
+# apeleaza functia de blocare/deblocare bruiaj - modificare: tratat ca toggle
+def _tog_jammer(self): self._jammer_toggle()
+
+# asigura sincronizarea starii vizuale a bruiajului cu ce ruleaza efectiv masina
+def _jammer_toggle(self):
+# trimite o comanda simpla si esp32-ul pastreaza starea intern self.send("J")
+self.jammer = not self.jammer if self.jammer:
+self._ind(self._ij, True, "JAMMER:		ACTIV", C["red_top"]) btn3d_update(self.btn_jam, "JAMMER	ON", "#8B0000", C["red"]) self._status("⚠	jammer rf activ!", C["red_top"])
+ 
+
+
+self._ind(self._ij, False, "JAMMER:	OPRIT") btn3d_update(self.btn_jam, "JAMMER OFF", C["red"], C["red_top"]) self._status("jammer rf oprit.")
+
+# functia care aprinde un bec extern atasat modului video direct prin http def _toggle_flash(self):
+# se ruleaza asincron printr-un fir pentru a nu intrerupe receptia de
+date
+threading.Thread(target=self._flash_worker, daemon=True).start()
+
+# trimite pe url o solicitare de on/off pentru flash def _flash_worker(self):
+try:
+ 
+
+
+
+
+
+succes
+
+
+
+"#E8B820"),
+ 
+s = "0" if self.flash else "1"
+r = requests.get(f"{LED_URL}?state={s}", timeout=2) if r.status_code == 200:
+self.flash = not self.flash
+# actualizeaza textul pe buton si indicatorii daca s-a aprins cu
+
+if self.flash: self.after(0, lambda: (
+btn3d_update(self.btn_flash, "FLASH	ON", C["amber"],
+
+self._ind(self._if, True, "FLASH:	APRINS",
+ 
+C["amber"]),
+ 
+
+self._status("flash wi-fi aprins.", C["amber"])
+))
+ 
+# revino la culorile normale daca s-a stins
+else:
+self.after(0, lambda: (
+btn3d_update(self.btn_flash, "FLASH OFF", C["green_main"], C["green_top"]),
+self._ind(self._if, False, "FLASH:	STINS"), self._status("flash wi-fi stins.")
+))
+# prinde erorile daca adresa led-ului nu raspunde si avertizeaza except requests.exceptions.RequestException:
+self.after(0, lambda: self._status(
+"⚠	eroare led wi-fi — verificati conexiunea.", C["red"]))
+
+# descarca si salveaza cadrul actual afisat cu tot cu suprapunerile de detectie
+def _snapshot(self):
+if self.det_frame is not None:
+ts = int(time.time()*1000)
+p = f"rezultate_licenta/detectie_{ts}.jpg" cv2.imwrite(p, self.det_frame)
+self._status(f" salvat: {p}", C["green_neon"]) else:
+self._status(" nu exista cadru valid!", C["red"])
+# procesarea fluxului video
+# functia asincrona care citeste neincetat de pe reteaua camerei def _cam_loop(self):
+while self.running:
+if self.cap.isOpened():
+ret, frame = self.cap.read()
+# daca preia un frame cu succes, stocheaza-l if ret: self.cur_frame = frame
+else:	time.sleep(0.01)
+# daca a pierdut conexiunea camerei, reincearca sa o acceseze
+ 
+
+else:
+time.sleep(1); self.cap.open(STREAM_URL)
+
+# functia de actualizare continua a canvas-ului si aplicarea modelelor ai def _vid_tick(self):
+if self.cur_frame is not None:
+self.fcnt += 1; self._fps_n += 1
+# evalueaza ai-ul doar la anumite intervale de cadre conform cfg if self.fcnt % AI_DETECT_EVERY_N == 0 and self.model:
+r = self.model(self.cur_frame, conf=0.4, verbose=False) self.det_frame = r[0].plot() # picteaza bouding box-urile din
+nou pe ecran
+elif self.det_frame is None:
+self.det_frame = self.cur_frame # in caz contrar afiseaza vizualul fara modificari
+# redimensionare si afisare imagine convertita fr = cv2.resize(self.det_frame, (800, 600)) rgb = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB)
+tk_img = ImageTk.PhotoImage(Image.fromarray(rgb)) self.lbl_vid.configure(image=tk_img) self.lbl_vid.image = tk_img
+
+ 
+
+optime
+ 
+# calculeaza frames per second pentru monitorizarea functionarii
+
+now = time.time()
+if now - self._fps_t >= 1.0: self.lbl_fps.configure(text=f"FPS: {self._fps_n}") self._fps_n = 0; self._fps_t = now
+# revino si interogheaza din nou dupa timpul desemnat in milisecunde self.after(VIDEO_UI_INTERVAL_MS, self._vid_tick)
+ 
+# administrarea inputului din tastele calculatorului
+# activeaza steagul din dictionar cand se intampla evenimentul de button down
+def _kp(self, e):
+k = e.keysym.lower()
+# modificare pentru bruiaj: j tratat separat ca si apasare simpla (nu apasare prelungita)
+# folosim after si getattr pentru protectie cand so tine tasta fortat apsata si o trimite multiplu
+if k == 'j':
+# auto-repeat se intampla cand so raporteaza repetat keypress fara release intermediar
+if not getattr(self, '_j_pressed', False):
+self._j_pressed = True self.after(0, self._jammer_toggle)
+return
+# pastreaza ca true in memorie tasta utila apasata if k in self.keys:
+self.keys[k] = True
+
+# de-inregistrarea tastelor la actiunea release def _kr(self, e):
+k = e.keysym.lower() if k == 'j':
+# repozitioneaza markerul flag pentru a accepta o noua apasare
+ 
+valida
+ 
+self._j_pressed = False return
+if k not in self.keys: return
+ 
+
+# adauga un scurt delay de 10ms pentru a elimina intreruperile native ale sistemului de operare
+def _delayed_release(): self.keys[k] = False
+self.after(10, _delayed_release)
+# logica controlerului principal de 50 hz
+# ruleaza constant in alt fir pentru a executa in timp real actiunile utilizatorului
+def _ctrl_loop(self):
+time.sleep(1); self.send(f"V{self.viteza}") # asigura ca viteza stabilita e comunicata
+while self.running:
+# gestionarea mentinerii activate pentru sistemul de apa (tine
+ 
+apasat)
+ 
+
+if self.keys['p'] and not self.pompa: self.pompa = True; self.send("P")
+self.after(0, lambda: self._ind(self._ip, True, "POMPA:
+ 
+PORNITA", C["blue"]))
+elif not self.keys['p'] and self.pompa: self.pompa = False; self.send("p")
+self.after(0, lambda: self._ind(self._ip, False, "POMPA:
+OPRITA"))
+
+# manipularea nivelului motorului cu taste (q pentru decrement, e pentru increment)
+v0 = self.viteza
+if self.keys['q']:	self.viteza = max(0,	self.viteza-5) elif self.keys['e']: self.viteza = min(255, self.viteza+5)
+# cand detecteaza schimbari in stare transmite direct comanda scrisa catre coada bluetooth
+if self.viteza != v0: self.send(f"V{self.viteza}") v = self.viteza self.after(0, lambda x=v: (
+self.lbl_v.configure(text=f" {x} / 255"), self._draw_bar(x)
+))
+
+# procesare instructiuni miscari mecanism camera directionala x-y nx, ny = self.ux, self.uy
+if self.keys['left']: nx = min(200, self.ux+3) elif self.keys['right']: nx = max(20, self.ux-3) if self.keys['up']:  ny = max(0, self.uy-3) elif self.keys['down']: ny = min(150, self.uy+3)
+# executa trimitere doar cand detecteaza miscarea efectiva
+if nx != self._lux: self.ux=nx; self._lux=nx; self.send(f"X{nx}") if ny != self._luy: self.uy=ny; self._luy=ny; self.send(f"Y{ny}")
+
+ 
+
+wasd
+ 
+# gestionarea deplasarii spatiale ale masinutei prin sagetile logice
+
+mc = "S" # presupune implicit pozitia stationara (stop)
+if self.keys['w']:	mc="F" # f vine de la inainte (forward)
+elif self.keys['s']: mc="B" # b de la inapoi (backward) elif self.keys['a']: mc="L" # l de la spre stanga (left) elif self.keys['d']: mc="R" # r de la spre dreapta (right)
+ 
+
+# schimba comanda activa doar daca se intrerupe sau se inlocuieste directia precedenta
+if mc != self.last_mc: self.send(mc); self.last_mc = mc
+ 
+
+ 
+
+
+STOP"}
+ 
+LB={"F":"MOTOR: INAINTE","B":"MOTOR: INAPOI",
+"L":"MOTOR: STANGA","R":"MOTOR: DREAPTA","S":"MOTOR:
+
+LC={"F":C["green_neon"],"B":C["amber"],
+"L":C["blue"],"R":"#9B59B6","S":C["text_dim"]}
+ 
+
+dupa decizie LC[x]))
+ 
+c=mc
+# adauga intarzierea ui pentru compatibilitate fire si coloreaza self.after(0, lambda x=c: self._ind(self._im, x!="S", LB[x],
+ 
+# asigura mentinerea tempoului de update dupa constanta data in configuratii
+time.sleep(CONTROL_LOOP_INTERVAL)
+
+# conexiunea fizica ble si pachetele de date
+# trimite in modul protectiv caracterele cu retur de linie in lista de trimitere
+def send(self, data):
+# curatam elemente extrem de vechi daca coada s-a supraincarcat prea
+ 
+tare
+ 
+
+if self.cmd_q.full():
+try: self.cmd_q.get_nowait() except queue.Empty: pass
+self.cmd_q.put(f"{data}\n")
+ 
+
+# animatie simpla a unui text cand se insceneaza in ciclu faza de instantiere conexiune
+def _ble_blink(self): if not self._ble_ok:
+cur = self.lbl_ble.cget("fg")
+# alterneaza culoarea intre doua moduri ca sa evidentieze stadiul
+ 
+neterminat
+
+C["amber"])
+ 
+
+self.lbl_ble.configure(fg=C["bg_dark"] if cur==C["amber"] else
+ 
+self.after(600, self._ble_blink)
+# initializeaza protocolul asincron impus de biblioteca bleak def _ble_start(self):
+loop = asyncio.new_event_loop() asyncio.set_event_loop(loop) loop.run_until_complete(self._ble_task())
+
+# taskul masina de stare care face descoperirea mac a numelui cerut async def _ble_task(self):
+while self.running: try:
+self._ble_ok = False
+self.after(0, lambda: self.lbl_ble.configure( text="● BLE: CAUTARE...", fg=C["amber"]))
+
+ 
+
+
+
+anterior
+ 
+# apeleaza biblioteca bleak pentru scanare locala de mediu devs	= await BleakScanner.discover(timeout=5.0)
+# izoleaza exclusiv modulul esp instalat si preprogramat target = next((d for d in devs if d.name==DEVICE_NAME), None)
+if not target:
+await asyncio.sleep(2); continue # repeta daca nu ii
+ 
+cunoaste identitatea
+self.after(0, lambda: self.lbl_ble.configure( text="● BLE: CONECTARE...", fg=C["amber"]))
+ 
+
+
+# initiem scrierea client server catre masina selectata async with BleakClient(target) as client:
+if not client.is_connected: continue
+self._ble_ok = True # am inregistrat o sesiune curata self.after(0, lambda: self.lbl_ble.configure(
+text="● BLE: CONECTAT ✔", fg=C["green_neon"])) self.after(0, lambda: self._status(
+"ble conectat. masinuta este pregatita!",
+C["green_neon"]))
+
+ 
+
+inoportune
+
+
+
+
+viteza
+
+
+
+
+
+coada de asteptare
+ 
+# dreneaza coada veche pentru a nu aplica actiuni restanta
+while not self.cmd_q.empty(): try: self.cmd_q.get_nowait() except queue.Empty: break
+
+# informeaza microcontrolerul despre profilul initial de
+
+await client.write_gatt_char(
+RX_UUID, bytearray(f"V{self.viteza}\n",'utf-8'),
+response=False)
+# in acest ciclu proceseaza doar pachete string aflate in
+
+while self.running and client.is_connected: try:
+ 
+msg = self.cmd_q.get(timeout=0.05) el = time.time()-self._last_w
+# limiteaza la interval sigur trimiterile prea apropiate ce pot arde conexiunea rx
+if el < BLE_WRITE_MIN_INTERVAL:
+await asyncio.sleep(BLE_WRITE_MIN_INTERVAL-el) # expediaza fizic prin antena bt textul incapsulat await client.write_gatt_char(
+RX_UUID, bytearray(msg,'utf-8'), response=False) self._last_w = time.time()
+except queue.Empty: await asyncio.sleep(0.01) # daca lista actiunilor e nepopulata
+except Exception as ex: print(f"[ble] {ex}"); break # a
+crapat scrierea
+
+# management erori generale cand semnalul moare in timpul functionarii standard
+except Exception as ex:
+print(f"[ble] {ex}"); self._ble_ok = False self.after(0, lambda: self.lbl_ble.configure(
+text=" BLE: DECONECTAT ", fg=C["red"]))
+self.after(0, lambda: self._status(
+"⚠	ble deconectat. reconectare automata...", C["red"])) await asyncio.sleep(2)
+# protectii de inchidere aleatoare pentru distrugerea programului
+# preia momentul deciziei de inchidere din cruce si blocheaza piese hardware inca active
+def on_closing(self):
+self.running = False # opreste iteratiile while simultan
+
+ 
+
+oprire
+ 
+# daca jammer-ul e inca functional la inchiderea software trimite urgent
+
+if self.jammer:
+try: self.cmd_q.put_nowait("J\n")
+ 
+
+except queue.Full: pass
+# garanteaza oprirea curentului motoarelor principale si pompei indiferent de mediu
+for c in ["S\n", "p\n"]:
+try: self.cmd_q.put_nowait(c) except queue.Full: pass
+time.sleep(0.3)
+
+# elibereaza buffer-ul video si omoara fereastra sistem de operare if hasattr(self,'cap') and self.cap.isOpened():
+self.cap.release() self.destroy()
+# functia main care invoca toata structura creata if  name  == " main ":
+app = App()
+app.protocol("WM_DELETE_WINDOW", app.on_closing) # asigura tratarea evenimentului global de inchidere x
+app.mainloop() # intretine interfata si event listener-ul grafic la nesfarsit
 
